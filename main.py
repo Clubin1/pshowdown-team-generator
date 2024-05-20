@@ -107,5 +107,7 @@ def transform_json_to_showdown_format(pokemon_list):
 
     pyperclip.copy(output.strip())
     print("Pokemon Showdown format copied to clipboard!")
+
+    
 if __name__ == '__main__':
     main()
