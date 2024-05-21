@@ -10,12 +10,11 @@ from selenium.webdriver.support import expected_conditions as EC
 import json
 import os
 from selenium.common.exceptions import TimeoutException
+from threading import Lock
 
-
-LIMIT = 10000
+LIMIT = 100000
 OFFSET = 0
-DATA_FILE = "pokemon_data.json"
-
+DATA_FILE = "pokemon_data_new.json"
 
 class Pokemon:
     def __init__(self):
@@ -25,7 +24,6 @@ class Pokemon:
         self.ability = ""
         self.nature = ""
         self.evs = []
-
 
 class PokemonEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -40,10 +38,8 @@ class PokemonEncoder(json.JSONEncoder):
             }
         return super().default(obj)
 
-
-generations = {"rb", "gs", "rs", "dp", "bw", "xy", "sm", "ss", "sv"}
+generations = ["rb", "gs", "rs", "dp", "bw", "xy", "sm", "ss", "sv"]
 pokemon_map = {}
-
 
 def fetch_pokemon_names(url):
     print(f"Fetching Pokemon names from {url}")
@@ -51,7 +47,6 @@ def fetch_pokemon_names(url):
     data = response.json()
     print(f"Fetched {len(data['results'])} Pokemon names")
     return data['results']
-
 
 def populate_pokemon_map():
     print("Populating Pokemon map...")
@@ -67,92 +62,82 @@ def populate_pokemon_map():
         pokemon_map[pokemon_name] = {"url": pokemon_url}
     print(f"Pokemon map populated with {len(pokemon_map)} entries")
 
-
 def try_get_pokemon_info(name, data, driver):
     print(f"Getting info for {name}...")
 
-    for gen in reversed(list(generations)):
+    for gen in reversed(generations):
         print(f"Trying generation {gen} for {name}")
         driver.get(f'https://www.smogon.com/dex/{gen}/pokemon/{name}/')
         try:
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CLASS_NAME, "PokemonFamily")))
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "DexBody")))
             print(f"Generation {gen} found for {name}")
         except TimeoutException:
             print(f"Generation {gen} not found for {name}")
             continue
-        page_source = driver.page_source
-        soup = BeautifulSoup(page_source, 'html.parser')
 
-        moveset_div = soup.find('div', class_='MovesetInfo')
-        moveset_table = moveset_div.find('table') if moveset_div else None
-        move_rows = moveset_table.find_all('tr') if moveset_table else []
+        try:
+            export_button = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "ExportButton"))
+            )
+            driver.execute_script("arguments[0].click();", export_button)
+            textarea = WebDriverWait(driver, 2).until(
+                EC.presence_of_element_located((By.TAG_NAME, "textarea"))
+            )
+            pokemon_info = textarea.get_attribute("value")
+            print(f"Pokemon info found for {name} in generation {gen}")
+            return pokemon_info
+        except (TimeoutException, Exception) as e:
+            print(f"Error finding or clicking export button: {str(e)}")
+            continue
 
-        evconfig_elem = soup.select_one('ul.evconfig')
-        item_elem = soup.select_one('.ItemList li a span:nth-of-type(3)')
-        ability_elem = soup.select_one('.AbilityList a span')
-        nature_elem = soup.select_one('.NatureList li')
-
-        if all([moveset_div, moveset_table, move_rows, evconfig_elem, item_elem, ability_elem, nature_elem]):
-            pokemon = Pokemon()
-            pokemon.name = name
-
-            moves = []
-            for row in move_rows:
-                move_link = row.find('a', class_='MoveLink')
-                if move_link:
-                    move_name = move_link.text.strip()
-                    moves.append(move_name)
-            pokemon.moves = moves
-
-            ev_values = [li.text.strip() for li in evconfig_elem.select('li')]
-            pokemon.evs = ev_values
-
-            pokemon.item = item_elem.text.strip()
-            pokemon.ability = ability_elem.text.strip()
-            pokemon.nature = nature_elem.text.strip()
-
-            return pokemon
-
+    print(f"No valid data found for {name}")
     return None
 
+def scrape_pokemon(index, name, data):
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    service = Service("/Users/jtubay/Desktop/chromedriver-mac-arm64/chromedriver")
+    driver = webdriver.Chrome(service=service, options=chrome_options)
 
-def scrape_pokemon(name, data, driver):
-    print(f"Scraping {name}...")
-    pokemon = try_get_pokemon_info(name, data, driver)
-    if pokemon:
+    pokemon_info = try_get_pokemon_info(name, data, driver)
+    driver.quit()
+
+    if pokemon_info:
         print(f"Scraped {name}")
+        return (index, {name: pokemon_info})
     else:
         print(f"No valid data found for {name}")
-    return pokemon
+        return (index, None)
 
+def scrape():
+    print("Starting scraping process...")
+
+    results = []
+    lock = Lock()
+
+    def append_result(result):
+        with lock:
+            results.append(result)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(scrape_pokemon, i, name, data) for i, (name, data) in enumerate(pokemon_map.items())]
+
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            append_result(result)
+
+    results.sort(key=lambda x: x[0])
+    pokemon_data = {k: v for _, d in results if d for k, v in d.items()}
+
+    save_data(pokemon_data)
+    print("Scraping process completed")
 
 def save_data(pokemon_data):
     print(f"Saving data to {DATA_FILE}")
     with open(DATA_FILE, 'w') as file:
         json.dump(pokemon_data, file, cls=PokemonEncoder, indent=4)
     print("Data saved")
-
-
-def scrape():
-    print("Starting scraping process...")
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    service = Service(
-        "/Users/jtubay/Desktop/chromedriver-mac-arm64/chromedriver")
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-
-    pokemon_data = {}
-
-    for name, data in pokemon_map.items():
-        pokemon = scrape_pokemon(name, data, driver)
-        if pokemon:
-            pokemon_data[pokemon.name] = pokemon
-
-    driver.quit()
-    save_data(pokemon_data)
-    print("Scraping process completed")
-
 
 print("Starting Pokemon scraper...")
 populate_pokemon_map()
